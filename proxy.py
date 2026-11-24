@@ -214,12 +214,26 @@ def _looks_like_wms_exception(body: bytes) -> bool:
     return head.startswith(b"<?xml") or head.startswith(b"<ServiceException")
 
 
+#: generous bound for an error/non-grid body we only need to classify, not use.
+_DRAIN_CAP = 4096
+
+
 def fetch_upstream(upstream_base: str, query: str, width: int, height: int, timeout: float = 15.0, retries: int = 4):
     """GET the GetMap query with the same Range window the mod itself sends.
     Treats 429/503 (IGN's documented ~1 req/s limit) as a backoff-and-retry
     condition distinct from a hard failure; any other non-(200/206), a WMS
     ServiceExceptionReport body, or a body whose length isn't exactly
-    width*height*4 bytes raises UpstreamError without being cached."""
+    width*height*4 bytes raises UpstreamError without being cached.
+
+    Status is checked BEFORE any body is read, and every read is capped --
+    `expected_bytes + 1` for a claimed success (IGN's own exact size is
+    always known up front from width*height, so this is a tight bound, not
+    a generous one), `_DRAIN_CAP` otherwise -- never an unbounded
+    `resp.read()`. An origin that ignores Range and tries to answer with
+    something far larger than the exact grid size is read only up to that
+    cap, found oversized by the length check below, and rejected -- it is
+    never allowed to force an unbounded download before that rejection
+    happens."""
     parsed = urllib.parse.urlsplit(upstream_base)
     full_path = parsed.path + "?" + query
     expected_bytes = width * height * 4
@@ -237,13 +251,18 @@ def fetch_upstream(upstream_base: str, query: str, width: int, height: int, time
                 headers={"User-Agent": "earth-platform/ign-rgealti-v1", "Range": f"bytes=0-{MAX_BYTES - 1}"},
             )
             resp = conn.getresponse()
-            body = resp.read()
             if resp.status in (429, 503):
                 slowed += 1
                 last_exc = UpstreamError(f"HTTP {resp.status} (rate limited) for {full_path}")
+                resp.read(_DRAIN_CAP)
                 continue
             if resp.status not in (200, 206):
                 last_exc = UpstreamError(f"HTTP {resp.status} for {full_path}")
+                resp.read(_DRAIN_CAP)
+                continue
+            body = resp.read(expected_bytes + 1)
+            if len(body) > expected_bytes:
+                last_exc = UpstreamError(f"response exceeded the expected {expected_bytes}-byte grid for {full_path} (origin may be ignoring Range)")
                 continue
             declared = resp.getheader("Content-Length")
             if declared is not None and int(declared) != len(body):

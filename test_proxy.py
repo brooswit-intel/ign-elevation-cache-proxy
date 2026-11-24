@@ -51,6 +51,13 @@ class FakeUpstream(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        elif bbox == "30.0,30.0,31.0,31.0":  # ignores Range entirely, answers with far more than requested
+            body = GOOD_BODY + b"\x00" * (1024 * 1024)
+            self.send_response(200)
+            self.send_header("Content-Type", "image/x-bil;bits=32")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
         else:  # "success" with the wrong number of bytes for its WIDTH/HEIGHT
             body = b"\x00" * 3
             self.send_response(200)
@@ -141,6 +148,12 @@ class ProxyTest(unittest.TestCase):
         resp, _ = self._get(other_query)
         self.assertEqual(resp.status, 502)
         self.assertIsNone(self.proxy.cache.get(ign.normalize_query(other_query)))
+
+    def test_origin_ignoring_range_is_rejected_not_downloaded_unbounded(self):
+        oversized_query = GOOD_QUERY.replace("BBOX=48.8,2.3,48.9,2.4", "BBOX=30,30,31,31")
+        resp, _ = self._get(oversized_query)
+        self.assertEqual(resp.status, 502)
+        self.assertIsNone(self.proxy.cache.get(ign.normalize_query(oversized_query)))
 
     def test_rate_limit_is_retried_not_treated_as_failure(self):
         FakeUpstream.rate_limit_countdown["n"] = 2
