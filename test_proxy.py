@@ -101,6 +101,14 @@ class ProxyTest(unittest.TestCase):
         conn.close()
         return resp, body
 
+    def _get_path(self, path, headers=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=15)
+        conn.request("GET", path, headers=headers or {})
+        resp = conn.getresponse()
+        body = resp.read()
+        conn.close()
+        return resp, body
+
     def test_query_validation_enforces_exact_getmap_shape(self):
         self.assertIsNotNone(ign.normalize_query(GOOD_QUERY))
         self.assertIsNone(ign.normalize_query(GOOD_QUERY.replace("LAYERS=ELEVATION.ELEVATIONGRIDCOVERAGE.HIGHRES", "LAYERS=SOME.OTHER.LAYER")))
@@ -234,6 +242,41 @@ class ProxyTest(unittest.TestCase):
                 self.assertEqual(proxy.upstream_base, "http://example.invalid/wms")
             finally:
                 proxy.close()
+
+    def test_health_endpoint_is_fresh_and_bypasses_the_grid_cache(self):
+        with mock.patch.object(ign.IgnCacheProxy, "HEALTH_PROBE_QUERY", GOOD_QUERY):
+            # Prime the ordinary cache so a stale hit there can't masquerade as a live probe.
+            self._get(GOOD_QUERY)
+            hits_before = len(FakeUpstream.hits)
+
+            resp, body = self._get_path("/__health")
+            self.assertEqual(resp.status, 200)
+            self.assertEqual(body, b"")
+            self.assertEqual(len(FakeUpstream.hits), hits_before + 1, "/__health must always hit upstream fresh, never the grid cache")
+
+            resp2, _ = self._get_path("/__health")
+            self.assertEqual(resp2.status, 200)
+            self.assertEqual(len(FakeUpstream.hits), hits_before + 2, "a second /__health call must probe again, not reuse the first result")
+            self.assertEqual(self.proxy.stats.as_dict()["probe_requests"], 2)
+
+    def test_health_endpoint_reports_failure_without_poisoning_grid_cache(self):
+        bad_probe_query = GOOD_QUERY.replace("BBOX=48.8,2.3,48.9,2.4", "BBOX=9,9,10,10")
+        with mock.patch.object(ign.IgnCacheProxy, "HEALTH_PROBE_QUERY", bad_probe_query):
+            resp, _ = self._get_path("/__health")
+            self.assertEqual(resp.status, 502)
+            self.assertEqual(self.proxy.stats.as_dict()["probe_failures"], 1)
+        self.assertIsNone(self.proxy.cache.get(ign.normalize_query(bad_probe_query)))
+
+    def test_head_on_ordinary_grid_goes_through_the_normal_cache(self):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=15)
+        conn.request("HEAD", "/?" + GOOD_QUERY)
+        resp = conn.getresponse()
+        body = resp.read()
+        conn.close()
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(body, b"")  # HEAD never carries a body
+        self.assertEqual(resp.getheader("Content-Length"), str(len(GOOD_BODY)))
+        self.assertEqual(len(FakeUpstream.hits), 1, "a HEAD on a grid must still go through (and populate) the ordinary cache")
 
 
 if __name__ == "__main__":

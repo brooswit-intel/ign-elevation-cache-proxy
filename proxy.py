@@ -110,6 +110,8 @@ class Stats:
     bytes_downloaded: int = 0
     evictions: int = 0
     rate_limited_retries: int = 0
+    probe_requests: int = 0
+    probe_failures: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def as_dict(self) -> dict:
@@ -122,6 +124,8 @@ class Stats:
                 "bytes_downloaded": self.bytes_downloaded,
                 "evictions": self.evictions,
                 "rate_limited_retries": self.rate_limited_retries,
+                "probe_requests": self.probe_requests,
+                "probe_failures": self.probe_failures,
             }
 
 
@@ -351,6 +355,33 @@ class IgnCacheProxy:
         query = normalize_query(raw_query)
         return False if query is None else self.cache.invalidate(query)
 
+    #: a representative, small, valid GetMap query the health probe uses -- any in-coverage
+    #: bbox/width/height works; kept deliberately tiny (16x16) to make the probe cheap.
+    HEALTH_PROBE_QUERY = (
+        "SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=ELEVATION.ELEVATIONGRIDCOVERAGE.HIGHRES"
+        "&STYLES=&CRS=EPSG:4326&BBOX=48.8,2.3,48.9,2.4&WIDTH=16&HEIGHT=16&FORMAT=image/x-bil;bits=32"
+    )
+
+    def health_check(self) -> tuple[int, dict]:
+        """The dedicated upstream health-check endpoint (/__health): TTL 0, always a fresh
+        live probe against the real upstream, never reads or writes the grid cache in either
+        direction. Reflects upstream reachability only, independent of EarthStatus's separate
+        plain-HEAD probe contract and HostBackoff's own Range recovery probe against an
+        ordinary GetMap URI -- both of those exercise the normal cache (TTL -1) on purpose;
+        this one deliberately never does."""
+        query = normalize_query(self.HEALTH_PROBE_QUERY)
+        width = int(urllib.parse.parse_qs(query)["WIDTH"][0])
+        height = int(urllib.parse.parse_qs(query)["HEIGHT"][0])
+        with self.stats.lock:
+            self.stats.probe_requests += 1
+        try:
+            fetch_upstream(self.upstream_base, query, width, height)
+            return 200, {}
+        except UpstreamError:
+            with self.stats.lock:
+                self.stats.probe_failures += 1
+            return 502, {}
+
     def close(self):
         self.cache.close()
 
@@ -361,27 +392,40 @@ def make_handler(proxy: IgnCacheProxy):
             pass
 
         def do_GET(self):
+            self._dispatch(write_body=True)
+
+        def do_HEAD(self):
+            # No method-based special-casing on the ordinary grid resource: a HEAD gets exactly
+            # the headers/status a GET would, through the normal TTL -1 cache, same as GET. The
+            # dedicated /__health endpoint below is the TTL-0 live-reachability probe.
+            self._dispatch(write_body=False)
+
+        def _dispatch(self, write_body):
             path, _, query = self.path.partition("?")
             if path == "/__stats":
                 import json
                 payload = json.dumps(proxy.stats.as_dict()).encode()
-                self._respond(200, {"Content-Type": "application/json"}, payload)
+                self._respond(200, {"Content-Type": "application/json"}, payload, write_body)
+                return
+            if path == "/__health":
+                status, headers = proxy.health_check()
+                self._respond(status, headers, b"", write_body)
                 return
             status, headers, body = proxy.serve_grid(query, self.headers.get("If-None-Match"), self.headers.get("Range"))
-            self._respond(status, headers, body)
+            self._respond(status, headers, body, write_body)
 
         def do_DELETE(self):
             _, _, query = self.path.partition("?")
             removed = proxy.invalidate(query)
-            self._respond(200 if removed else 404, {}, b"")
+            self._respond(200 if removed else 404, {}, b"", write_body=True)
 
-        def _respond(self, status, headers, body):
+        def _respond(self, status, headers, body, write_body=True):
             self.send_response(status)
             for key, value in headers.items():
                 self.send_header(key, value)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            if body:
+            if write_body and body:
                 self.wfile.write(body)
 
     return Handler
