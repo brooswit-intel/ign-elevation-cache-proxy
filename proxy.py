@@ -44,6 +44,7 @@ from __future__ import annotations
 import hashlib
 import http.client
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -217,6 +218,27 @@ def _looks_like_wms_exception(body: bytes) -> bool:
 #: generous bound for an error/non-grid body we only need to classify, not use.
 _DRAIN_CAP = 4096
 
+_CONTENT_RANGE_RE = re.compile(r"^bytes (\d+)-\d+/\d+$")
+
+
+def _content_range_proves_wrong_offset(resp) -> bool:
+    """Every request here always asks for Range: bytes=0-N. Live verification
+    (2026-11-24) showed the real IGN service answers 206 WITHOUT a
+    Content-Range header at all -- unlike GSI's CloudFront-backed service, so
+    the two proxies can't share one contract here. This can only prove a
+    definite mismatch when the header is actually present: a 206 whose
+    Content-Range explicitly claims a non-zero start is rejected rather than
+    trusted blind -- a response with the right length but the wrong offset
+    (observed in the wild on another Earth Platform proxy, MINECRAFT-571
+    55866) would otherwise be written into the cache as if it were this
+    grid's own first bytes. An absent header (IGN's own normal case) proves
+    nothing either way and is allowed through."""
+    value = resp.getheader("Content-Range")
+    if value is None:
+        return False
+    m = _CONTENT_RANGE_RE.match(value)
+    return m is not None and m.group(1) != "0"
+
 
 def fetch_upstream(upstream_base: str, query: str, width: int, height: int, timeout: float = 15.0, retries: int = 4):
     """GET the GetMap query with the same Range window the mod itself sends.
@@ -258,6 +280,10 @@ def fetch_upstream(upstream_base: str, query: str, width: int, height: int, time
                 continue
             if resp.status not in (200, 206):
                 last_exc = UpstreamError(f"HTTP {resp.status} for {full_path}")
+                resp.read(_DRAIN_CAP)
+                continue
+            if resp.status == 206 and _content_range_proves_wrong_offset(resp):
+                last_exc = UpstreamError(f"206 for {full_path} has a Content-Range that proves a non-zero offset: {resp.getheader('Content-Range')!r}")
                 resp.read(_DRAIN_CAP)
                 continue
             body = resp.read(expected_bytes + 1)

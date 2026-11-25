@@ -58,6 +58,15 @@ class FakeUpstream(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        elif bbox == "40.0,40.0,41.0,41.0":
+            # 206 with the right length but a Content-Range offset that proves it is not
+            # byte 0 -- the exact equal-length wrong-offset case from MINECRAFT-571 55866.
+            self.send_response(206)
+            self.send_header("Content-Type", "image/x-bil;bits=32")
+            self.send_header("Content-Length", str(len(GOOD_BODY)))
+            self.send_header("Content-Range", f"bytes 20-{20 + len(GOOD_BODY) - 1}/10000")
+            self.end_headers()
+            self.wfile.write(GOOD_BODY)
         else:  # "success" with the wrong number of bytes for its WIDTH/HEIGHT
             body = b"\x00" * 3
             self.send_response(200)
@@ -154,6 +163,12 @@ class ProxyTest(unittest.TestCase):
         resp, _ = self._get(oversized_query)
         self.assertEqual(resp.status, 502)
         self.assertIsNone(self.proxy.cache.get(ign.normalize_query(oversized_query)))
+
+    def test_206_with_wrong_offset_content_range_is_rejected(self):
+        wrong_offset_query = GOOD_QUERY.replace("BBOX=48.8,2.3,48.9,2.4", "BBOX=40,40,41,41")
+        resp, _ = self._get(wrong_offset_query)
+        self.assertEqual(resp.status, 502, "a 206 whose Content-Range proves a non-zero offset must never be trusted as this grid's own bytes")
+        self.assertIsNone(self.proxy.cache.get(ign.normalize_query(wrong_offset_query)))
 
     def test_rate_limit_is_retried_not_treated_as_failure(self):
         FakeUpstream.rate_limit_countdown["n"] = 2
